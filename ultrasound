@@ -1,3 +1,849 @@
+# PSEUDO CODE: ResNet101-based Grayscale Classifier with Stratified Splits, Metrics, Grad-CAM, Checkpoints, and Per-image Inference Timing
+
+# --------------------------------
+# 0) CONFIG & IMPORT EQUIVALENTS
+# --------------------------------
+SET IMG_SIZE = 512
+SET BATCH_SIZE = 8
+SET NUM_CLASSES = 3
+SET TOTAL_EPOCHS = 2000
+SET LR = 1e-3
+SET CHECKPOINT_DIR = "ResNet_checkpoints(30,50,100,200,500,1000,2000)"
+SET CHECKPOINT_EPOCHS = [2, 30, 50, 100, 200, 500, 1000, 2000]
+SET GRADCAM_INPUT_DIR = "/.../sorted_dataset/grad_cam_input"
+
+# --------------------------------
+# 1) DATASET (CUSTOM) & TRANSFORMS
+# --------------------------------
+DEFINE Transform:
+    Resize to (IMG_SIZE, IMG_SIZE)
+    Convert to Grayscale(1)
+    ToTensor
+    Normalize(mean=0.5, std=0.5)
+
+CLASS ImageDataset(root_dir, transform):
+    SCAN subfolders as class names; build class_to_idx
+    COLLECT image file paths (*.jpg|*.png|*.jpeg) and labels
+    __len__: return number of images
+    __getitem__(i):
+        load image[i], convert "L"
+        apply transform
+        return (image_tensor, label, image_path)
+
+INSTANTIATE dataset = ImageDataset(root_dir, Transform)
+
+# --------------------------------
+# 2) STRATIFIED SPLITS & LOADERS
+# --------------------------------
+labels = dataset.labels
+paths  = dataset.image_files
+
+STRATIFIED SPLIT (test_val=0.3) -> train_idx, temp_idx
+STRATIFIED SPLIT on temp (val=test=0.5) -> val_idx_local, test_idx_local
+MAP local indices back to global: val_idx, test_idx
+
+CREATE Subsets: train_dataset, val_dataset, test_dataset
+CREATE DataLoaders:
+    train_loader (batch=BATCH_SIZE, shuffle=True)
+    val_loader   (batch=BATCH_SIZE, shuffle=False)
+    test_loader  (batch=BATCH_SIZE, shuffle=False)
+
+# --------------------------------
+# 3) MODEL: ResNetImage (ResNet101 backbone)
+# --------------------------------
+CLASS ResNetImage(num_classes):
+    base = ResNet101(pretrained=True)
+    REPLACE base.conv1 with Conv2d(in_channels=1, out=64, k=7, s=2, p=3, bias=False)  # grayscale support
+    in_features = base.fc.in_features
+    REPLACE base.fc with Sequential(Dropout(p=0.5), Linear(in_features -> num_classes))
+    forward(x): return base(x)
+
+# Utility: print_param_counts(model, title)
+#   total_params, trainable_params
+#   try split into backbone vs fc by matching parameter names ("resnet.fc")
+
+# --------------------------------
+# 4) DEVICE, LOSS, OPTIMIZER, METRICS
+# --------------------------------
+device = GPU if available else CPU
+model = ResNetImage(num_classes=len(dataset.class_to_idx)).to(device)
+print_param_counts(model, title="[ResNetImage]")
+
+criterion = CrossEntropyLoss()
+optimizer = Adam(model.parameters(), lr=LR)
+
+FUNCTION calculate_metrics(model, dataloader, device):
+    model.eval(); INIT all_labels=[], all_preds=[]
+    NO GRAD:
+        FOR images, labels, _ IN dataloader:
+            move to device
+            logits = model(images)
+            preds  = argmax(logits, dim=1)
+            append labels and preds (cpu numpy)
+    accuracy  = Accuracy(all_labels, all_preds)
+    precision = Precision_macro(all_labels, all_preds, zero_division=0)
+    recall    = Recall_macro(all_labels, all_preds, zero_division=0)
+    CM = ConfusionMatrix(all_labels, all_preds)
+    specificity_per_class:
+        FOR each class i:
+            tn = sum(CM) - row_sum(i) - col_sum(i) + CM[i,i]
+            fp = col_sum(i) - CM[i,i]
+            spec_i = tn / (tn + fp) if denom>0 else 0
+    specificity = mean(spec_i)
+    RETURN accuracy, precision, recall, specificity
+
+FUNCTION measure_single_image_inference(model, image_path, device, n_runs=100, warmup=10):
+    model.eval()
+    preprocess = Transform (same as above)
+    input_tensor = preprocess(load image as "L").unsqueeze(0).to(device)
+    IF device is CUDA:
+        pre-create start/end CUDA events
+    NO GRAD:
+        RUN warmup passes
+        INIT times=[]
+        REPEAT n_runs:
+            IF CUDA:
+                record start; forward(model, input_tensor); record end; synchronize; append elapsed_ms
+            ELSE:
+                t0 = wallclock(); forward(); append (wallclock()-t0)*1000
+    RETURN times  # list of ms
+
+# --------------------------------
+# 5) GRAD-CAM (target: layer4)
+# --------------------------------
+CLASS GradCAM(model, target_layer):
+    REGISTER forward hook on target_layer to cache activations
+    REGISTER full backward hook on target_layer to cache gradients
+    METHOD generate_cam(input_image_tensor, target_class):
+        model.eval()
+        x = input_image_tensor.unsqueeze(0).to(device)
+        logits = model(x)
+        model.zero_grad()
+        class_score = logits[:, target_class]
+        BACKWARD(class_score)
+        weights = mean(gradients over H,W; keepdim)
+        cam = sum(weights * activations over channels)
+        RELU(cam)
+        RESIZE cam to (IMG_SIZE, IMG_SIZE)
+        NORMALIZE cam to [0,1]
+        RETURN cam
+
+FUNCTION visualize_gradcam(image_path, model, grad_cam, save_dir, epoch=None):
+    ensure save_dir
+    input_tensor = Transform(load image as "L")
+    with NO GRAD:
+        pred_class = argmax(model(input_tensor.unsqueeze(0).to(device)), dim=1)
+    cam = grad_cam.generate_cam(input_tensor, pred_class)
+    bgr = cv2.imread(image_path); resize to (IMG_SIZE, IMG_SIZE)
+    heatmap = applyColorMap(uint8(255*cam), JET)
+    blended = addWeighted(bgr, 0.5, heatmap, 0.5)
+    fname = stem(image_path)
+    out = f"{save_dir}/{fname}_epoch{epoch}.png" if epoch else f"{save_dir}/{fname}_gradcam.png"
+    write out image
+
+INIT grad_cam = GradCAM(model, target_layer = model.resnet.layer4)
+
+# --------------------------------
+# 6) TRAINING LOOP + EVAL + CHECKPOINT + ANALYSIS
+# --------------------------------
+MAKE_DIR(CHECKPOINT_DIR)
+
+FOR epoch IN [1 .. TOTAL_EPOCHS]:
+    # ---- Train ----
+    model.train(); total_loss = 0
+    FOR images, labels, _ IN train_loader:
+        move to device
+        optimizer.zero_grad()
+        logits = model(images)
+        loss = criterion(logits, labels)
+        BACKPROP(loss)
+        optimizer.step()
+        total_loss += loss.item()
+
+    # ---- Evaluate on TEST (as per code) ----
+    (acc, prec, rec, spec) = calculate_metrics(model, test_loader, device)
+    PRINT epoch, total_loss, acc, prec, rec, spec
+
+    # ---- Checkpoints ----
+    IF epoch IN CHECKPOINT_EPOCHS:
+        SAVE {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict()
+        } TO f"{CHECKPOINT_DIR}/checkpoint_{epoch}.pth"
+
+    # ---- Analysis at epoch == 100 ----
+    IF epoch == 100:
+        save_dir = "./grad_cam_output"; MAKE_DIR(save_dir)
+        png_paths = sorted(list all *.png under GRADCAM_INPUT_DIR)
+        IF png_paths is empty: WARN no files
+        FOR each p IN png_paths:
+            # Grad-CAM and save
+            visualize_gradcam(p, model, grad_cam, save_dir, epoch=epoch)
+            # Single-image inference timing
+            times = measure_single_image_inference(model, p, device, n_runs=100)
+            avg_ms = mean(times)
+            PRINT f"[{basename(p)}] avg {avg_ms:.2f} ms over 100 runs"
+            # Save timing plot per image
+            PLOT times vs run_index; draw vertical line at avg_ms; title includes file stem
+            SAVE figure to f"{save_dir}/ResNet_Single_Image_Inference_Time_{stem(p)}.png"
+
+# PSEUDO CODE: Fast R-CNN–style Image Classifier (ResNet101 backbone, grayscale input)
+# Includes: custom dataset, transforms, loaders, parameter counts, single-batch timing,
+# training loop, checkpoints, Grad-CAM (layer4), metrics, and final visualization
+
+# --------------------------------
+# 0) CONFIG
+# --------------------------------
+SET IMG_SIZE      = 512
+SET BATCH_SIZE    = 8
+SET NUM_CLASSES   = 3
+SET LR            = 1e-3
+SET TOTAL_EPOCHS  = 2000
+SET CHECKPOINT_DIR = "FastRCNN_checkpoints(30,50,100,200,500,1000,2000)"
+SET CHECKPOINT_EPOCHS = [2, 30, 50, 100, 200, 1000, 2000]
+SET GRADCAM_OUTPUT_DIR = "/.../FastRCNN_gradcam"
+SET TRAIN_DIR = "/.../dataset"
+SET VAL_DIR   = "/.../15_val"
+
+# --------------------------------
+# 1) DATASET & TRANSFORMS
+# --------------------------------
+DEFINE Transform:
+    Resize to (IMG_SIZE, IMG_SIZE)
+    Grayscale(1)
+    ToTensor
+    Normalize(mean=0.485, std=0.229)
+
+CLASS ImageDataset(root_dir, transform):
+    INIT:
+        build class_to_idx from sorted subfolders under root_dir
+        for each class folder:
+            collect *.jpg|*.png|*.jpeg paths (ignore non-files)
+            append label via class_to_idx
+        print total image count
+    __len__(): return number of images
+    __getitem__(i):
+        load image[i] as "L"
+        apply transform
+        return (tensor, label)
+
+INSTANTIATE:
+    train_dataset = ImageDataset(TRAIN_DIR, Transform)
+    val_dataset   = ImageDataset(VAL_DIR,   Transform)
+
+CREATE DataLoaders:
+    train_loader (train_dataset, batch=BATCH_SIZE, shuffle=True)
+    val_loader   (val_dataset,   batch=BATCH_SIZE, shuffle=True)
+
+# --------------------------------
+# 2) MODEL: FastRCNNClassifier (classification head over whole image as single RoI)
+# --------------------------------
+CLASS FastRCNNClassifier(num_classes):
+    feature_extractor = ResNet101(pretrained=True)
+    REPLACE feature_extractor.conv1 with Conv2d(1->64, k=7, s=2, p=3, bias=False)  # grayscale support
+    roi_pool = AdaptiveAvgPool2d((7, 7))  # treat whole feature map as single RoI
+    fc = Sequential(
+        Linear(2048*7*7 -> 1024), ReLU, Dropout(0.5),
+        Linear(1024 -> num_classes)
+    )
+    forward(x):
+        x = feature_extractor.conv1/bn1/relu/maxpool
+        x = feature_extractor.layer1/2/3/4
+        x = roi_pool(x)
+        x = flatten(x)
+        logits = fc(x)
+        return logits
+
+# Utility: count_parameters(model)
+#   returns total_params, trainable_params
+#   print both (in millions)
+
+# --------------------------------
+# 3) DEVICE, INSTANTIATION, LOSS, OPTIMIZER
+# --------------------------------
+device = GPU if available else CPU
+model  = FastRCNNClassifier(NUM_CLASSES).to(device)
+PRINT total/trainable parameter counts
+
+criterion = CrossEntropyLoss()
+optimizer = Adam(model.parameters(), lr=LR)
+
+# --------------------------------
+# 4) SINGLE-BATCH INFERENCE TIME (DUMMY)
+# --------------------------------
+FUNCTION measure_inference_time(model, device, input_size=(1,1,IMG_SIZE,IMG_SIZE), runs=100, warmup=10):
+    model.eval()
+    dummy = random_normal_tensor(input_size).to(device)
+    NO GRAD:
+        repeat warmup times: forward(model, dummy)
+        if CUDA: synchronize()
+        times=[]
+        repeat runs:
+            if CUDA:
+                start_event(); forward(); end_event(); synchronize(); append elapsed_ms
+            else:
+                t0=now(); forward(); append (now()-t0)*1000
+    avg_ms = mean(times)
+    return times, avg_ms
+
+(times, avg_ms) = measure_inference_time(model, device)
+PLOT times vs run_index; draw vertical line at avg_ms; SAVE "FastRCNN_Single_Batch_Inference_Time_swapped.png"
+
+# --------------------------------
+# 5) TRAINING LOOP + CHECKPOINTS + (periodic) GRAD-CAM
+# --------------------------------
+MAKE_DIR(CHECKPOINT_DIR)
+MAKE_DIR(GRADCAM_OUTPUT_DIR)
+target_layer = model.feature_extractor.layer4
+start_time = now()
+
+FOR epoch in [1 .. TOTAL_EPOCHS]:
+    # ---- Train ----
+    model.train(); total_loss = 0
+    FOR (images, labels) in train_loader:
+        move to device
+        optimizer.zero_grad()
+        logits = model(images)
+        loss = criterion(logits, labels)
+        BACKPROP(loss)
+        optimizer.step()
+        total_loss += loss.item()
+    PRINT epoch, total_loss, elapsed_time_since(start_time)
+
+    # ---- Checkpoint (selected epochs) ----
+    IF epoch in CHECKPOINT_EPOCHS:
+        SAVE {'epoch', 'model_state_dict', 'optimizer_state_dict'} TO f"{CHECKPOINT_DIR}/checkpoint_{epoch}.pth"
+        PRINT saved checkpoint
+
+        # ---- Grad-CAM on a few validation images (for inspection) ----
+        INIT grad_cam = GradCAM(model, target_layer)
+        FOR i in [0..2]:
+            img_path = val_dataset.image_files[i]
+            image    = load PIL "L"
+            tensor   = Transform(image).unsqueeze(0).to(device)
+            model.eval()
+            with NO GRAD:
+                pred_class = argmax(model(tensor))
+            cam = grad_cam.generate_cam(tensor, pred_class)  # (1,H,W) normalized 0..1
+            cam_uint8 = to_uint8(cam)
+            heatmap   = applyColorMap(resize(cam_uint8, orig_size), JET)
+            original  = cv2.imread(img_path); ensure 3ch BGR
+            overlay   = addWeighted(original, 0.5, heatmap, 0.5)
+            SAVE overlay TO f"{GRADCAM_OUTPUT_DIR}/epoch{epoch}_img{i}.jpg"
+            PRINT saved Grad-CAM path
+
+# --------------------------------
+# 6) METRICS (on validation)
+# --------------------------------
+FUNCTION calculate_metrics(model, dataloader, device):
+    model.eval(); all_labels=[], all_preds=[]
+    NO GRAD:
+        FOR (images, labels) in dataloader:
+            move to device
+            logits = model(images)
+            preds  = argmax(logits, dim=1)
+            append labels/preds (cpu numpy)
+    accuracy  = Accuracy(all_labels, all_preds)
+    precision = Precision_macro(all_labels, all_preds, zero_division=0)
+    recall    = Recall_macro(all_labels, all_preds, zero_division=0)
+    CM = ConfusionMatrix(all_labels, all_preds)
+    specificity_per_class:
+        FOR class i:
+            tn = sum(CM) - row_sum(i) - col_sum(i) + CM[i,i]
+            fp = col_sum(i) - CM[i,i]
+            spec_i = tn / (tn + fp) if denom>0 else 0
+    specificity = mean(spec_i)
+    RETURN accuracy, precision, recall, specificity
+
+(acc, prec, rec, spec) = calculate_metrics(model, val_loader, device)
+PRINT final validation metrics
+
+# --------------------------------
+# 7) GRAD-CAM CORE (layer4)
+# --------------------------------
+CLASS GradCAM(model, target_layer):
+    REGISTER forward_hook on target_layer -> cache activations
+    REGISTER backward_hook on target_layer -> cache gradients
+    METHOD generate_cam(input_tensor, class_idx):
+        model.eval()
+        logits = model(input_tensor)
+        model.zero_grad()
+        target = logits[:, class_idx]
+        BACKWARD(target)
+        weights = mean(gradients over H,W; keepdim)
+        cam = sum(weights * activations over channels)
+        RELU(cam); MIN-MAX normalize to [0,1]
+        RETURN cam  # shape (1,H,W)
+
+# --------------------------------
+# 8) FINAL VISUALIZATION (single example)
+# --------------------------------
+target_layer = model.feature_extractor.layer4
+grad_cam = GradCAM(model, target_layer)
+test_image_path = val_dataset.image_files[0]
+# visualize_grad_cam(test_image_path, model, grad_cam, device):
+#   - preprocess to tensor
+#   - forward->pred_class
+#   - cam = grad_cam.generate_cam(...)
+#   - build heatmap + overlay
+#   - SAVE to GRADCAM_OUTPUT_DIR
+
+
+
+# PSEUDO CODE: YOLOv11 (Ultralytics) image classification pipeline with stratified splits,
+# dataset materialization to YOLO folder layout, training, parameter counts,
+# Grad-CAM snapshots across epochs (and best/last), and evaluation metrics/plots.
+
+# --------------------------------
+# 0) PATHS & CONFIG
+# --------------------------------
+SET DATA_DIR      = "/.../ultrasound/sorted_dataset"
+SET TMP_DIR       = DATA_DIR + "/dataset_yolo"         # YOLO expects split folders with class subdirs
+SET GRAD_DIR      = DATA_DIR + "/gradcam"
+MAKE_DIR(GRAD_DIR)
+
+SET IMG_SIZE      = 512
+SET BATCH_SIZE    = 8
+SET EPOCHS        = 1000
+SET OPTIMIZER     = "Adam"
+SET LR0           = 1e-3
+SET WORKERS       = 0
+SET SAVE_PERIOD   = 50          # save weights every N epochs
+SET RUN_NAME      = "train"     # Ultralytics run name (outputs under runs/classify/train)
+
+# --------------------------------
+# 1) COLLECT IMAGES & STRATIFIED SPLITS
+# --------------------------------
+# Assumption: data layout like .../sorted_dataset/<class_name>/*.png
+all_imgs   = glob(DATA_DIR + "/*/*.png")
+all_labels = MAP each image path -> basename(parent folder)   # string labels
+
+# Encode string labels to numeric IDs (0..K-1), keep mapping for later
+label_to_id = build_label_index(sorted(unique(all_labels)))
+y_numeric   = [label_to_id[lbl] for lbl in all_labels]
+
+# Stratified split: Train 70%, Val 15%, Test 15%
+(train_paths, test_paths, train_lbls, test_lbls) = StratifiedSplit(all_imgs, all_labels, test_size=0.3, random_state=42)
+(val_paths,  test_paths, val_lbls,  test_lbls ) = StratifiedSplit(test_paths, test_lbls, test_size=0.5, random_state=42)
+
+# --------------------------------
+# 2) MATERIALIZE YOLO FOLDER STRUCTURE
+# --------------------------------
+FUNCTION save_to_yolo_folder(images, labels, split_name):
+    FOR each class_id in [0..K-1]:
+        MAKE_DIR(TMP_DIR / split_name / class_id)    # class subfolders under split
+    FOR i, (img_path, lbl_str) IN enumerate(zip(images, labels)):
+        class_id = label_to_id[lbl_str]
+        img      = READ_IMAGE(img_path) as numpy array (uint8)
+        PIL.Image.fromarray(img).save(TMP_DIR / split_name / class_id / f"{i}.jpg")
+
+CALL save_to_yolo_folder(train_paths, train_lbls, "train")
+CALL save_to_yolo_folder(val_paths,   val_lbls,   "val")
+CALL save_to_yolo_folder(test_paths,  test_lbls,  "test")
+PRINT "images saved to YOLO folder layout"
+
+# --------------------------------
+# 3) OPTIONAL: TENSOR TRANSFORM (for Grad-CAM samples)
+# --------------------------------
+DEFINE transform:
+    numpy -> PIL
+    Resize(IMG_SIZE, IMG_SIZE)
+    Grayscale(1)
+    ToTensor()
+    RepeatChannels(1->3)        # YOLO cls models expect 3 channels
+
+# --------------------------------
+# 4) TRAIN YOLOv11 CLASSIFIER
+# --------------------------------
+# Using Ultralytics classification task; model zoo weight "yolo11n-cls.pt"
+model = YOLO("yolo11n-cls.pt")
+
+results = model.train(
+    data      = str(TMP_DIR),   # directory with train/val/test splits and class subdirs
+    epochs    = EPOCHS,
+    imgsz     = IMG_SIZE,
+    batch     = BATCH_SIZE,
+    workers   = WORKERS,
+    name      = RUN_NAME,
+    exist_ok  = True,
+    patience  = 0,              # disable early stopping
+    optimizer = OPTIMIZER,
+    lr0       = LR0,
+    save_period = SAVE_PERIOD
+)
+
+# At this point, weights will be under runs/classify/train/weights:
+#   - best.pt, last.pt, and epochN.pt artifacts every SAVE_PERIOD.
+
+# --------------------------------
+# 5) GRAD-CAM (pytorch-grad-cam) FOR CLASSIFICATION
+# --------------------------------
+# Choose a few validation samples to visualize
+val_samples       = TAKE_FIRST_N(load_images(val_paths), N=3)        # as numpy arrays
+val_sample_labels = TAKE_FIRST_N([label_to_id[l] for l in val_lbls], N=3)
+
+# Wrapper to run CAM on YOLO classifier:
+FUNCTION visualize_gradcam(model, image_tensor, class_id, save_path):
+    model.eval()
+    device = device_of(model)
+
+    # Select a convolutional target layer inside the YOLO classifier backbone/head.
+    target_layer = model.model.model[-3]         # a late conv layer (implementation-specific)
+
+    CLASS WrappedYOLO(nn.Module):
+        INIT(model):
+            self.stack = model.model.model       # underlying nn.Module sequence
+        FORWARD(x):
+            out = self.stack(x)
+            RETURN out[0] if tuple else out      # ensure logits tensor
+
+    wrapped = WrappedYOLO(model)
+
+    cam = GradCAM(model=wrapped, target_layers=[target_layer])
+    input_tensor = image_tensor.unsqueeze(0).to(device).requires_grad_()
+
+    grayscale_cam = cam(input_tensor=input_tensor,
+                        targets=[ClassifierOutputTarget(class_id)])[0]   # (H,W) normalized
+    rgb_image = image_tensor.permute(1,2,0).cpu().numpy()
+    rgb_image = MINMAX_NORMALIZE(rgb_image)
+    overlay   = show_cam_on_image(rgb_image, grayscale_cam, use_rgb=True)
+    SAVE_IMAGE(save_path, overlay)
+
+# Produce Grad-CAM snapshots at selected epochs and also for best/last:
+EPOCH_SNAPSHOTS = [50,100,200,300,400,500,600,700,800,900,1000,1100,1200,1300,1400]
+
+FOR epoch IN EPOCH_SNAPSHOTS:
+    weight_path = f"runs/classify/{RUN_NAME}/weights/epoch{epoch}.pt"
+    IF NOT EXISTS(weight_path): PRINT "skip"; CONTINUE
+    model = YOLO(weight_path)
+    FOR idx, (img_np, lbl_id) IN enumerate(zip(val_samples, val_sample_labels)):
+        img_tensor = transform(img_np.astype(uint8))
+        save_path  = GRAD_DIR / f"epoch{epoch}_sample{idx}_class{lbl_id}.jpg"
+        visualize_gradcam(model, img_tensor, lbl_id, save_path)
+
+FOR special IN ["best", "last"]:
+    weight_path = f"runs/classify/{RUN_NAME}/weights/{special}.pt"
+    IF EXISTS(weight_path):
+        model = YOLO(weight_path)
+        FOR idx, (img_np, lbl_id) IN enumerate(zip(val_samples, val_sample_labels)):
+            img_tensor = transform(img_np.astype(uint8))
+            save_path  = GRAD_DIR / f"{special}_sample{idx}_class{lbl_id}.jpg"
+            visualize_gradcam(model, img_tensor, lbl_id, save_path)
+
+# --------------------------------
+# 6) PARAMETER COUNTS (for reporting)
+# --------------------------------
+FUNCTION _to_torch_module(obj):
+    IF isinstance(obj, nn.Module): RETURN obj
+    m = getattr(obj, "model", None)
+    IF isinstance(m, nn.Module): RETURN m
+    mm = getattr(m, "model", None)
+    IF isinstance(mm, nn.Module): RETURN mm
+    RAISE TypeError
+
+FUNCTION print_param_counts(obj, title="[YOLO]"):
+    m = _to_torch_module(obj)
+    IF DataParallel/Distributed: m = m.module
+    total     = SUM(p.numel() for p in m.parameters())
+    trainable = SUM(p.numel() for p in m.parameters() if p.requires_grad)
+    PRINT f"{title} total: {total} ({total/1e6:.2f} M)"
+    PRINT f"{title} trainable: {trainable} ({trainable/1e6:.2f} M)"
+
+final_model = YOLO(f"runs/classify/{RUN_NAME}/weights/best.pt")
+print_param_counts(final_model, title="[YOLOv11-cls best.pt]")
+
+# --------------------------------
+# 7) EVALUATION (Validation & Test)
+# --------------------------------
+# Utility to run classification predictions using Ultralytics .predict
+FUNCTION evaluate(model, images_np, labels_ids, name):
+    preds = []
+    FOR img_np, lbl_id IN zip(images_np, labels_ids):
+        img_pil = to_PIL(img_np.astype(uint8))
+        pred    = model.predict(img_pil, imgsz=640, verbose=False)[0]
+        preds.append(int(pred.probs.top1))
+    trues = [int(y) for y in labels_ids]
+
+    acc  = Accuracy(trues, preds)
+    prec = Precision_macro(trues, preds, zero_division=0)
+    rec  = Recall_macro(trues, preds, zero_division=0)
+    cm   = ConfusionMatrix(trues, preds)   # shape KxK
+
+    # Specificity (macro): mean over classes
+    specs = []
+    FOR i in [0..K-1]:
+        tn = sum(cm) - row_sum(i) - col_sum(i) + cm[i,i]
+        fp = col_sum(i) - cm[i,i]
+        spec_i = tn / (tn + fp) if denom>0 else 0
+        specs.append(spec_i)
+    spec = mean(specs)
+
+    # (Optionally) F1 macro
+    f1 = F1_macro(trues, preds, zero_division=0)
+
+    PRINT name, acc, prec, rec, spec, f1
+    PLOT_HEATMAP(cm, title=f"{name} Confusion Matrix",
+                 save_path=DATA_DIR + f"/{lower(name)}_confusion_matrix.png")
+
+# Gather arrays for evaluation
+val_imgs_np  = LOAD_IMAGES_AS_ARRAYS(val_paths)   # each HxW or HxWxC uint8
+test_imgs_np = LOAD_IMAGES_AS_ARRAYS(test_paths)
+val_ids      = [label_to_id[l] for l in val_lbls]
+test_ids     = [label_to_id[l] for l in test_lbls]
+
+evaluate(final_model, val_imgs_np,  val_ids,  name="Validation")
+evaluate(final_model, test_imgs_np, test_ids, name="Test")
+
+
+# PSEUDO CODE: VGG19-based grayscale classifier (TF/Keras)
+# Includes: custom dataset, stratified splits, class weights, generators,
+# frozen VGG19 backbone w/ grayscale→RGB shim, timing plot, callbacks (ckpt, metrics, Grad-CAM),
+# training, test metrics, and tee-logging
+
+# --------------------------------
+# 0) CONFIG & PATHS
+# --------------------------------
+SET DATASET_DIR         = "/.../sorted_dataset/dataset"
+SET GRADCAM_INPUT_DIR   = "/.../sorted_dataset/grad_cam_input"
+SET GRADCAM_OUTPUT_DIR  = "/.../sorted_dataset/grad_cam_output/VGG19_gradcam"
+SET LOG_DIR             = "./logs"
+SET CHECKPOINT_DIR      = "VGG19_checkpoints(30,50,100,200,500,1000,2000)"
+
+SET IMAGE_SIZE          = (512, 512)
+SET INPUT_SHAPE         = (512, 512, 1)      # grayscale
+SET NUM_CLASSES         = 3
+SET BATCH_SIZE          = 8
+SET EPOCHS              = 2000
+SET LR                  = 1e-3
+SET CHECKPOINT_EPOCHS   = [2, 30, 50, 100, 200, 500, 1000, 2000]
+
+# --------------------------------
+# 1) DATASET (custom) & PREPROCESSING
+# --------------------------------
+CLASS ImageDataset(root_dir):
+    INIT:
+        class_to_idx = {sorted subfolders -> 0..K-1}
+        FOR each class_folder under root_dir:
+            collect all *.jpg|*.png|*.jpeg files (recursively)
+            append file_path and its numeric label
+        PRINT total image count
+    __len__(): return number of files
+    __getitem__(i):
+        load PIL image at files[i] as grayscale "L"
+        RETURN (PIL_image_L, label)
+
+FUNCTION preprocess_image(pil_image):
+    resize to IMAGE_SIZE
+    arr = to_numpy / 255.0
+    expand channel dim to (H, W, 1)
+    RETURN arr
+
+# --------------------------------
+# 2) STRATIFIED SPLITS (train/val/test = 70/15/15)
+# --------------------------------
+LOAD dataset = ImageDataset(DATASET_DIR)
+labels = dataset.labels
+files  = dataset.image_files
+
+STRATIFIED SPLIT (test_size=0.3) -> train_indices, temp_indices
+STRATIFIED SPLIT on temp_indices (test_size=0.5) -> val_indices, test_indices
+
+PRINT per-split sizes and per-label counts (build small DataFrames if desired)
+
+# --------------------------------
+# 3) CLASS WEIGHTS (balanced)
+# --------------------------------
+COMPUTE class_weights over labels
+BUILD class_weight_dict: {class_id -> weight}
+
+# --------------------------------
+# 4) DATA GENERATORS (NumPy yielders)
+# --------------------------------
+FUNCTION data_generator(dataset, indices, batch_size):
+    WHILE True:
+        FOR i from 0 to len(indices) step batch_size:
+            batch_idx = indices[i:i+batch_size]
+            images = []; labels=[]
+            FOR idx in batch_idx:
+                pil_img, y = dataset[idx]
+                images.append(preprocess_image(pil_img))
+                labels.append(y)
+            YIELD (np.array(images), np.array(labels))
+
+FUNCTION data_generator_with_weights(dataset, indices, batch_size, class_weights):
+    WHILE True:
+        FOR i from 0 to len(indices) step batch_size:
+            batch_idx = indices[i:i+batch_size]
+            images = []; labels=[]; weights=[]
+            FOR idx in batch_idx:
+                pil_img, y = dataset[idx]
+                images.append(preprocess_image(pil_img))
+                labels.append(y)
+                weights.append(class_weights[y])
+            YIELD (np.array(images), np.array(labels), np.array(weights))
+
+INSTANTIATE:
+    train_gen = data_generator_with_weights(dataset, train_indices, BATCH_SIZE, class_weight_dict)
+    val_gen   = data_generator(dataset,           val_indices,   BATCH_SIZE)
+    test_gen  = data_generator(dataset,           test_indices,  BATCH_SIZE)
+
+SET steps_per_epoch   = len(train_indices) // BATCH_SIZE
+SET validation_steps  = len(val_indices)   // BATCH_SIZE
+SET test_steps        = len(test_indices)  // BATCH_SIZE
+
+# --------------------------------
+# 5) MODEL: VGG19 (frozen) + GAP + Dense head (softmax)
+# --------------------------------
+INPUT  = Keras Input(shape=INPUT_SHAPE)         # (H,W,1)
+X      = Conv2D(3, k=3, padding="same", activation="relu")(INPUT)  # grayscale→RGB
+VGG    = VGG19(input_shape=(512,512,3), weights="imagenet", include_top=False)
+FREEZE all layers in VGG
+FEATS  = VGG(X)
+HEAD   = GlobalAveragePooling2D()(FEATS)
+HEAD   = Dense(256, activation="relu")(HEAD)
+HEAD   = Dense(128, activation="relu")(HEAD)
+LOGITS = Dense(NUM_CLASSES, activation="softmax")(HEAD)
+MODEL  = Model(INPUT, LOGITS)
+
+PRINT total_params, trainable_params, non_trainable_params
+
+# --------------------------------
+# 6) COMPILE & INFERENCE-TIME MEASUREMENT
+# --------------------------------
+COMPILE MODEL with Adam(lr=LR), loss="sparse_categorical_crossentropy", metrics=["accuracy"]
+
+FUNCTION measure_inference_time(tf_model, input_shape=(1,512,512,1), runs=100, warmup=10):
+    dummy = random_normal(input_shape)
+    FOR warmup times: tf_model(dummy, training=False)
+    times=[]
+    REPEAT runs:
+        t0 = wallclock()
+        tf_model(dummy, training=False)
+        append (wallclock()-t0)*1000 to times
+    RETURN times, mean(times)
+
+(times, avg_ms) = measure_inference_time(MODEL)
+PLOT times vs run_index; vertical line at avg_ms; SAVE "Vgg19_Single-Batch_Inference_Time.png"
+
+# --------------------------------
+# 7) CALLBACKS
+# --------------------------------
+CLASS CustomModelCheckpoint(Callback):
+    on_epoch_end(epoch, logs):
+        if (epoch+1) in CHECKPOINT_EPOCHS:
+            SAVE model weights to f"{CHECKPOINT_DIR}/checkpoint_{epoch+1}.h5"
+            PRINT saved checkbox
+
+CLASS CustomMetricsCallback(Callback):
+    INIT(val_gen, val_steps): store; start_time=None
+    on_train_begin(): start_time = now()
+    on_epoch_end(epoch, logs):
+        # collect val predictions over val_steps
+        all_labels, all_preds = [], []
+        REPEAT val_steps:
+            Xb, yb = next(val_gen)
+            pb = argmax(model.predict(Xb, verbose=0), axis=1)
+            extend all_labels with yb; extend all_preds with pb
+        COMPUTE precision_macro, recall_macro, f1_macro, specificity_macro from confusion matrix
+        elapsed_time = now() - start_time
+        (optionally attach to logs or print)
+
+# ---- Grad-CAM (Keras) ----
+FUNCTION load_preprocess(path, target_size=(512,512)):
+    load grayscale; to array; /255.0; expand dims -> (1,H,W,1)
+    RETURN tensor
+
+FUNCTION resolve_layer_by_path(model, path_str):
+    # e.g., "vgg19/block5_conv4"
+    traverse model.get_layer(path) elements by "/"
+    RETURN layer
+
+FUNCTION make_gradcam_heatmap(img_tensor, model, last_conv_layer_path, pred_index=None):
+    conv_layer = resolve_layer_by_path(model, last_conv_layer_path)
+    grad_model = Model(inputs=model.inputs, outputs=[conv_layer.output, model.output])
+    WITH GradientTape:
+        conv_out, preds = grad_model(img_tensor, training=False)
+        IF pred_index is None: pred_index = argmax(preds[0])
+        loss = preds[:, pred_index]
+    grads   = gradient(loss, conv_out)
+    weights = mean(grads over (H,W))
+    heatmap = sum(conv_out[0] * weights over channels)
+    RELU(heatmap); normalize to [0,1]
+    RETURN heatmap
+
+FUNCTION save_superimposed(src_path, heatmap, save_path, alpha=0.4):
+    read original BGR; resize heatmap; colorize JET; blend; makedirs; imwrite
+
+CLASS GradCAMCallback(Callback):
+    INIT(img_dir, save_dir, target_layer_path, epochs_to_watch):
+        list pngs under img_dir
+        ensure save_dir
+        store layer path and watch set
+    on_epoch_end(epoch, logs):
+        if (epoch+1) in epochs_to_watch:
+            FOR each path in pngs:
+                inp = load_preprocess(path)
+                hm  = make_gradcam_heatmap(inp, self.model, target_layer_path)
+                save_superimposed(path, hm, f"{save_dir}/epoch{epoch+1}_{basename(path)}")
+
+INSTANTIATE:
+    gradcam_cb = GradCAMCallback(
+        img_dir=GRADCAM_INPUT_DIR,
+        save_dir=GRADCAM_OUTPUT_DIR,
+        target_layer_path="vgg19/block5_conv4",
+        epochs_to_watch=CHECKPOINT_EPOCHS
+    )
+
+# --------------------------------
+# 8) TRAIN
+# --------------------------------
+START timer
+MODEL.fit(
+    train_gen,
+    steps_per_epoch  = steps_per_epoch,
+    validation_data  = val_gen,
+    validation_steps = validation_steps,
+    epochs           = EPOCHS,
+    verbose          = 0,
+    callbacks        = [CustomModelCheckpoint(), CustomMetricsCallback(val_gen, validation_steps), gradcam_cb]
+)
+PRINT total elapsed time (sec, min)
+
+# --------------------------------
+# 9) EVALUATION on TEST
+# --------------------------------
+FUNCTION calculate_metrics(model, data_gen, steps):
+    all_labels, all_preds = [], []
+    REPEAT steps:
+        Xb, yb = next(data_gen)
+        pb = argmax(model.predict(Xb), axis=1)
+        extend yb/pb
+    accuracy  = Accuracy(all_labels, all_preds)
+    precision = Precision_macro(...)
+    recall    = Recall_macro(...)
+    specificity:
+        build confusion_matrix
+        FOR class i:
+            tn = total - (row_i_sum + col_i_sum - diag_i)
+            fp = col_i_sum - diag_i
+            spec_i = tn/(tn+fp) if denom>0 else 0
+        mean of spec_i
+    RETURN accuracy, precision, recall, specificity
+
+(acc, prec, rec, spec) = calculate_metrics(MODEL, test_gen, test_steps)
+PRINT final test metrics
+
+# --------------------------------
+# 10) LOGGING (tee to file)
+# --------------------------------
+CREATE LOG_DIR if not exists
+now_str = timestamp()
+open file LOG_DIR/train_log_{now_str}.txt
+WRAP stdout with Tee(sys.stdout, log_file)  # mirror console to file
+
+
+
 # PSEUDO CODE: UNet-based Image Classifier with Stratified Splits, Class Weights, Metrics, Grad-CAM, and Checkpointing
 
 # -----------------------------
