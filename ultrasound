@@ -1,0 +1,228 @@
+# PSEUDO CODE: UNet-based Image Classifier with Stratified Splits, Class Weights, Metrics, Grad-CAM, and Checkpointing
+
+# -----------------------------
+# 0) CONFIG
+# -----------------------------
+SET IMG_SIZE = 512
+SET BATCH_SIZE = 8
+SET NUM_CLASSES = 3
+SET EPOCHS = 2000
+SET LEARNING_RATE = 1e-3
+SET SAVE_EPOCHS = [2, 30, 50, 100, 200, 500, 1000, 2000]
+SET CHECKPOINT_DIR = "UNet_checkpoint(30,50,100,200,500,1000,2000)"
+
+# -----------------------------
+# 1) DATA & TRANSFORMS
+# -----------------------------
+DEFINE transform:
+    - Convert to Grayscale (channels=1)
+    - Resize to (IMG_SIZE, IMG_SIZE)
+    - To Tensor
+    - Normalize(mean=0.5, std=0.5)
+
+LOAD dataset FROM data_dir WITH transform
+
+# -----------------------------
+# 2) CLASS WEIGHTS
+# -----------------------------
+EXTRACT label_array FROM dataset
+COMPUTE class_weights = balanced class weights over label_array
+CONVERT class_weights TO tensor
+
+# -----------------------------
+# 3) STRATIFIED SPLIT (TRAIN / VAL / TEST)
+# -----------------------------
+STRATIFIED SPLIT (test_val_size = 0.3) -> train_idx, test_val_idx
+STRATIFIED SPLIT ON test_val_idx (val_size = 0.5) -> test_idx, val_idx
+
+CREATE train_dataset = Subset(dataset, train_idx)
+CREATE val_dataset   = Subset(dataset, val_idx)
+CREATE test_dataset  = Subset(dataset, test_idx)
+
+CREATE train_loader (train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+CREATE val_loader   (val_dataset,   batch_size=BATCH_SIZE, shuffle=False)
+CREATE test_loader  (test_dataset,  batch_size=BATCH_SIZE, shuffle=False)
+
+# -----------------------------
+# 4) MODEL: UNetClassifier
+# -----------------------------
+DEFINE DoubleConv(in_ch, out_ch):
+    CONV(in_ch->out_ch, k=3, pad=1) -> BN -> ReLU
+    CONV(out_ch->out_ch, k=3, pad=1) -> BN -> ReLU
+    RETURN block
+
+DEFINE Down(in_ch, out_ch):
+    MaxPool2d(2) -> DoubleConv(in_ch, out_ch)
+
+DEFINE Up(in_ch, out_ch):
+    UpConv: ConvTranspose2d(in_ch -> in_ch/2, k=2, stride=2)
+    CONCAT(skip, upsampled)
+    DoubleConv(in_ch, out_ch)
+
+DEFINE UNetClassifier(in_channels=1, num_classes=NUM_CLASSES, base_ch=64):
+    enc1 = DoubleConv(in_channels, base_ch)
+    enc2 = Down(base_ch, base_ch*2)
+    enc3 = Down(base_ch*2, base_ch*4)
+    enc4 = Down(base_ch*4, base_ch*8)
+
+    dec1 = Up(base_ch*8, base_ch*4)
+    dec2 = Up(base_ch*4, base_ch*2)
+    dec3 = Up(base_ch*2, base_ch)
+
+    outc = Conv2d(base_ch -> base_ch, k=1)
+    GAP  = AdaptiveAvgPool2d(1)
+    FC   = Linear(base_ch -> num_classes)
+
+    FORWARD(x):
+        x1 = enc1(x)
+        x2 = enc2(x1)
+        x3 = enc3(x2)
+        x4 = enc4(x3)
+
+        u1 = dec1(x4, x3)
+        u2 = dec2(u1, x2)
+        u3 = dec3(u2, x1)
+
+        f  = outc(u3)
+        v  = GAP(f) -> flatten
+        logits = FC(v)
+        RETURN logits
+
+# -----------------------------
+# 5) DEVICE, LOSS, OPTIMIZER
+# -----------------------------
+SET device = GPU if available else CPU
+INSTANTIATE model = UNetClassifier(...).to(device)
+PRINT total and trainable parameters
+
+SET criterion = CrossEntropyLoss(weight=class_weights on device)
+SET optimizer = Adam(model.params, lr=LEARNING_RATE)
+
+# -----------------------------
+# 6) INFERENCE-TIME MEASUREMENT (DUMMY)
+# -----------------------------
+FUNCTION measure_inference_time(model, device, input_size=(1,1,IMG_SIZE,IMG_SIZE), runs=100, warmup=10):
+    model.eval()
+    CREATE dummy_input with input_size on device
+    NO GRAD:
+        RUN warmup forward passes
+        SYNC device if needed
+        times = []
+        REPEAT runs TIMES:
+            start_event()
+            FORWARD model(dummy_input)
+            end_event()
+            SYNC device
+            APPEND elapsed_ms to times
+    avg_ms = MEAN(times)
+    RETURN times, avg_ms
+
+(times, avg_ms) = measure_inference_time(model, device)
+PLOT times vs run_index; DRAW vertical line at avg_ms; SAVE figure
+
+# -----------------------------
+# 7) TRAINING LOOP
+# -----------------------------
+CREATE CHECKPOINT_DIR if not exists
+best_val_loss = +INF
+start_time = now()
+
+FOR epoch IN [1 .. EPOCHS]:
+    # ---- Train ----
+    model.train()
+    train_loss_sum = 0
+    FOR each batch (imgs, labels) IN train_loader:
+        MOVE imgs, labels TO device
+        optimizer.zero_grad()
+        outputs = model(imgs)
+        loss = criterion(outputs, labels)
+        BACKPROP loss
+        optimizer.step()
+        train_loss_sum += loss.item()
+    avg_train_loss = train_loss_sum / num_train_batches
+    PRINT epoch, avg_train_loss, elapsed_time_since(start_time)
+
+    # ---- Validate ----
+    model.eval()
+    val_loss_sum = 0
+    INIT all_preds = [], all_labels = []
+    NO GRAD:
+        FOR each batch (imgs, labels) IN val_loader:
+            MOVE to device
+            outputs = model(imgs)
+            loss = criterion(outputs, labels)
+            val_loss_sum += loss.item()
+            preds = argmax(outputs, dim=1)
+            EXTEND all_preds with preds.cpu()
+            EXTEND all_labels with labels.cpu()
+    avg_val_loss = val_loss_sum / num_val_batches
+
+    # ---- Metrics (Val) ----
+    COMPUTE:
+        Accuracy(all_labels, all_preds)
+        Precision_macro(all_labels, all_preds, zero_division=0)
+        Recall_macro(all_labels, all_preds, zero_division=0)  # Sensitivity
+        F1_macro(all_labels, all_preds, zero_division=0)
+        ConfusionMatrix with labels [0,1,2]
+        Specificity per class from CM:
+            FOR class i:
+                TP = CM[i,i]
+                FN = row_sum(i) - TP
+                FP = col_sum(i) - TP
+                TN = total_sum - (TP+FN+FP)
+                spec_i = TN / (TN + FP) if denom>0 else 0
+            Specificity = mean(spec_i)
+    PRINT epoch, avg_val_loss, metrics
+
+    # ---- Checkpointing ----
+    IF epoch IN SAVE_EPOCHS:
+        SAVE model.state_dict() TO "{CHECKPOINT_DIR}/checkpoint_{epoch}.pth"
+
+    # ---- Grad-CAM at final epoch only (epoch == 2000) ----
+    IF epoch == 2000:
+        SET grad_cam_input_img_dir
+        COLLECT img_paths = all *.png files under grad_cam_input_img_dir
+        INIT gradcam with (model, target_layer = model.outc)
+
+        FOR each (idx, path) IN enumerate(img_paths):
+            LOAD image as gray
+            TENSORIZE using same transform (no batch)
+            cam = gradcam.generate_cam(tensor)  # class idx = argmax by default
+            LOAD original image (color), resize to (IMG_SIZE, IMG_SIZE)
+            HEATMAP = colorize(cam)
+            OVERLAY = blend(original, HEATMAP, alpha=0.5)
+            SAVE OVERLAY TO "{CHECKPOINT_DIR}/gradcam/epoch{epoch}_{idx}_{stem}.png"
+        PRINT "Saved Grad-CAM images"
+
+    # ---- Best model tracking ----
+    IF avg_val_loss < best_val_loss:
+        best_val_loss = avg_val_loss
+        SAVE {
+          epoch, model_state_dict, optimizer_state_dict, val_loss=best_val_loss
+        } TO "{CHECKPOINT_DIR}/checkpoint_best.pth"
+        PRINT "New best model saved"
+
+PRINT "Training complete."
+
+# -----------------------------
+# 8) GRAD-CAM CORE (ABSTRACT)
+# -----------------------------
+CLASS GradCAM(model, target_layer):
+    REGISTER forward hook on target_layer to cache activations
+    REGISTER backward hook on target_layer to cache gradients
+
+    METHOD generate_cam(input_tensor, class_idx=None):
+        model.eval()
+        x = add_batch_dim(input_tensor).to(device_of_model)
+        logits = model(x)
+        IF class_idx is None: class_idx = argmax(logits[0])
+        ZERO grad on model
+        loss = logits[0, class_idx]
+        BACKWARD(loss)
+        grads = cached_gradients[0]          # (C,H,W)
+        acts  = cached_activations[0]        # (C,H,W)
+        weights = mean(grads over spatial dims)  # (C,1,1)
+        cam = sum(weights * acts over channels)  # (H,W)
+        RELU(cam); RESIZE to (IMG_SIZE, IMG_SIZE)
+        NORMALIZE to [0,1]
+        RETURN cam
